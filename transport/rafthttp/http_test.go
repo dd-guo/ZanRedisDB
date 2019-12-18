@@ -26,11 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coreos/etcd/version"
 	"github.com/youzan/ZanRedisDB/pkg/pbutil"
 	"github.com/youzan/ZanRedisDB/pkg/types"
 	"github.com/youzan/ZanRedisDB/raft/raftpb"
 	"github.com/youzan/ZanRedisDB/snap"
-	"github.com/coreos/etcd/version"
 )
 
 func TestServeRaftPrefix(t *testing.T) {
@@ -182,6 +182,10 @@ func TestServeRaftStreamPrefix(t *testing.T) {
 		{
 			RaftStreamPrefix + "/msgapp/1",
 			streamTypeMsgAppV2,
+		},
+		{
+			RaftStreamPrefix + "/batchmsgapp/1",
+			streamTypeMsgAppV3,
 		},
 	}
 	for i, tt := range tests {

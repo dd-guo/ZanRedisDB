@@ -94,6 +94,16 @@ func (enc *msgAppV2Encoder) isContinue(m *raftpb.Message) bool {
 		isSameGroup(&enc.ToGroup, &m.ToGroup) && isSameGroup(&enc.FromGroup, &m.FromGroup)
 }
 
+func (enc *msgAppV2Encoder) encodeBatch(bm *raftpb.BatchMessages) error {
+	for _, m := range bm.Msgs {
+		err := enc.encode(&m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (enc *msgAppV2Encoder) encode(m *raftpb.Message) error {
 	start := time.Now()
 	switch {
@@ -197,22 +207,23 @@ func newMsgAppV2Decoder(r io.Reader, local, remote types.ID) *msgAppV2Decoder {
 	}
 }
 
-func (dec *msgAppV2Decoder) decode() (raftpb.Message, error) {
+func (dec *msgAppV2Decoder) decode(bm *raftpb.BatchMessages) (*raftpb.BatchMessages, error) {
 	var (
 		m   raftpb.Message
 		typ uint8
 	)
 	if _, err := io.ReadFull(dec.r, dec.uint8buf); err != nil {
-		return m, err
+		return bm, err
 	}
 	typ = uint8(dec.uint8buf[0])
 	switch typ {
 	case msgTypeLinkHeartbeat:
-		return linkHeartbeatMessage, nil
+		bm.Msgs = append(bm.Msgs, linkHeartbeatMessage)
+		return bm, nil
 	case msgTypeAppEntries:
 		if uint64(dec.remote) != dec.FromGroup.NodeId ||
 			uint64(dec.local) != dec.ToGroup.NodeId {
-			return m, fmt.Errorf("remote node and local node maybe not matched: %v, %v (%v, %v)",
+			return bm, fmt.Errorf("remote node and local node maybe not matched: %v, %v (%v, %v)",
 				dec.remote, dec.local, dec.FromGroup, dec.ToGroup)
 		}
 		m = raftpb.Message{
@@ -228,43 +239,43 @@ func (dec *msgAppV2Decoder) decode() (raftpb.Message, error) {
 
 		// decode entries
 		if _, err := io.ReadFull(dec.r, dec.uint64buf); err != nil {
-			return m, err
+			return bm, err
 		}
 		l := binary.BigEndian.Uint64(dec.uint64buf)
 		m.Entries = make([]raftpb.Entry, int(l))
 		for i := 0; i < int(l); i++ {
 			if _, err := io.ReadFull(dec.r, dec.uint64buf); err != nil {
-				return m, err
+				return bm, err
 			}
 			size := binary.BigEndian.Uint64(dec.uint64buf)
 			var buf []byte
 			if size <= msgAppV2BufSize {
 				buf = dec.buf[:size]
 				if _, err := io.ReadFull(dec.r, buf); err != nil {
-					return m, err
+					return bm, err
 				}
 			} else {
 				buf = make([]byte, int(size))
 				if _, err := io.ReadFull(dec.r, buf); err != nil {
-					return m, err
+					return bm, err
 				}
 			}
 			dec.index++
 			// 1 alloc
 			err := pbutil.MaybeUnmarshal(&m.Entries[i], buf)
 			if err != nil {
-				return m, err
+				return bm, err
 			}
 		}
 		// decode commit index
 		if _, err := io.ReadFull(dec.r, dec.uint64buf); err != nil {
-			return m, err
+			return bm, err
 		}
 		m.Commit = binary.BigEndian.Uint64(dec.uint64buf)
 	case msgTypeApp:
 		var size uint64
 		if err := binary.Read(dec.r, binary.BigEndian, &size); err != nil {
-			return m, err
+			return bm, err
 		}
 		var buf []byte
 		if size <= msgAppV2BufSize {
@@ -273,11 +284,11 @@ func (dec *msgAppV2Decoder) decode() (raftpb.Message, error) {
 			buf = make([]byte, int(size))
 		}
 		if _, err := io.ReadFull(dec.r, buf); err != nil {
-			return m, err
+			return bm, err
 		}
 		err := pbutil.MaybeUnmarshal(&m, buf)
 		if err != nil {
-			return m, err
+			return bm, err
 		}
 
 		dec.term = m.Term
@@ -288,7 +299,8 @@ func (dec *msgAppV2Decoder) decode() (raftpb.Message, error) {
 			dec.index = m.Entries[l-1].Index
 		}
 	default:
-		return m, fmt.Errorf("failed to parse type %d in msgappv2 stream", typ)
+		return bm, fmt.Errorf("failed to parse type %d in msgappv2 stream", typ)
 	}
-	return m, nil
+	bm.Msgs = append(bm.Msgs, m)
+	return bm, nil
 }

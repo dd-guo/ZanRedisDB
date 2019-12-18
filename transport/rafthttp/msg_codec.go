@@ -29,6 +29,16 @@ type messageEncoder struct {
 	w io.Writer
 }
 
+func (enc *messageEncoder) encodeBatch(bm *raftpb.BatchMessages) error {
+	for _, m := range bm.Msgs {
+		err := enc.encode(&m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (enc *messageEncoder) encode(m *raftpb.Message) error {
 	if err := binary.Write(enc.w, binary.BigEndian, uint64(m.Size())); err != nil {
 		return err
@@ -54,14 +64,14 @@ func newMessageDecoder(r io.Reader) *messageDecoder {
 		buf: make([]byte, msgAppV2BufSize),
 	}
 }
-func (dec *messageDecoder) decode() (raftpb.Message, error) {
+func (dec *messageDecoder) decode(bm *raftpb.BatchMessages) (*raftpb.BatchMessages, error) {
 	var m raftpb.Message
 	var l uint64
 	if err := binary.Read(dec.r, binary.BigEndian, &l); err != nil {
-		return m, err
+		return bm, err
 	}
 	if l > readBytesLimit {
-		return m, ErrExceedSizeLimit
+		return bm, ErrExceedSizeLimit
 	}
 	var buf []byte
 	if l < uint64(len(dec.buf)) {
@@ -70,7 +80,12 @@ func (dec *messageDecoder) decode() (raftpb.Message, error) {
 		buf = make([]byte, int(l))
 	}
 	if _, err := io.ReadFull(dec.r, buf); err != nil {
-		return m, err
+		return bm, err
 	}
-	return m, m.Unmarshal(buf)
+	err := m.Unmarshal(buf)
+	if err != nil {
+		return bm, err
+	}
+	bm.Msgs = append(bm.Msgs, m)
+	return bm, nil
 }

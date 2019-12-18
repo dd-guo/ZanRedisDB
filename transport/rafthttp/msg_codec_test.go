@@ -74,6 +74,8 @@ func TestMessage(t *testing.T) {
 			ErrExceedSizeLimit,
 		},
 	}
+	bm := &raftpb.BatchMessages{}
+	bm.Msgs = make([]raftpb.Message, 0, 1)
 	for i, tt := range tests {
 		b := &bytes.Buffer{}
 		enc := &messageEncoder{w: b}
@@ -82,14 +84,16 @@ func TestMessage(t *testing.T) {
 			continue
 		}
 		dec := &messageDecoder{r: b}
-		m, err := dec.decode()
+		var err error
+		bm.Msgs = bm.Msgs[:0]
+		bm, err = dec.decode(bm)
 		if err != tt.decodeErr {
 			t.Errorf("#%d: decode message error expected %v, got %v", i, tt.decodeErr, err)
 			continue
 		}
 		if err == nil {
-			if !reflect.DeepEqual(m, tt.msg) {
-				t.Errorf("#%d: message = %+v, want %+v", i, m, tt.msg)
+			if !reflect.DeepEqual(bm.Msgs[0], tt.msg) {
+				t.Errorf("#%d: message = %+v, want %+v", i, bm, tt.msg)
 			}
 		}
 	}

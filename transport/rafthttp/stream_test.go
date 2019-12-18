@@ -107,7 +107,7 @@ func TestStreamWriterAttachBadOutgoingConn(t *testing.T) {
 }
 
 func TestStreamReaderDialRequest(t *testing.T) {
-	for i, tt := range []streamType{streamTypeMessage, streamTypeMsgAppV2} {
+	for i, tt := range []streamType{streamTypeMessage, streamTypeMsgAppV2, streamTypeMsgAppV3} {
 		tr := &roundTripperRecorder{rec: &testutil.RecorderBuffered{}}
 		sr := &streamReader{
 			peerID: types.ID(2),
@@ -236,7 +236,7 @@ func (wrc *waitReadCloser) Close() error {
 // TestStreamReaderDialDetectUnsupport tests that dial func could find
 // out that the stream type is not supported by the remote.
 func TestStreamReaderDialDetectUnsupport(t *testing.T) {
-	for i, typ := range []streamType{streamTypeMsgAppV2, streamTypeMessage} {
+	for i, typ := range []streamType{streamTypeMsgAppV3, streamTypeMsgAppV2, streamTypeMessage} {
 		// the response from etcd 2.0
 		tr := &respRoundTripper{
 			code:   http.StatusNotFound,
@@ -287,6 +287,11 @@ func TestStream(t *testing.T) {
 		},
 		{
 			streamTypeMsgAppV2,
+			msgapp,
+			recvc,
+		},
+		{
+			streamTypeMsgAppV3,
 			msgapp,
 			recvc,
 		},

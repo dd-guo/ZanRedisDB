@@ -189,7 +189,9 @@ func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dec := &messageDecoder{r: r.Body}
-	m, err := dec.decode()
+	bm := &raftpb.BatchMessages{}
+	var err error
+	bm, err = dec.decode(bm)
 	if err != nil {
 		msg := fmt.Sprintf("failed to decode raft message (%v)", err)
 		plog.Errorf(msg)
@@ -198,6 +200,15 @@ func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(bm.Msgs) == 0 {
+		msg := fmt.Sprintf("raft snap message empty")
+		plog.Errorf(msg)
+		http.Error(w, msg, http.StatusBadRequest)
+		recvFailures.WithLabelValues(r.RemoteAddr).Inc()
+		return
+	}
+	// for snapshot we only handle the first is ok
+	m := bm.Msgs[0]
 	receivedBytes.WithLabelValues(m.FromGroup.String()).Add(float64(m.Size()))
 
 	if m.Type != raftpb.MsgSnap {
@@ -267,7 +278,9 @@ func (h *snapshotHandler) checkSnapshotState(m raftpb.Message) bool {
 
 func (h *snapshotHandler) handleSnapshotCheck(w http.ResponseWriter, r *http.Request) {
 	dec := &messageDecoder{r: r.Body}
-	m, err := dec.decode()
+	bm := &raftpb.BatchMessages{}
+	var err error
+	bm, err = dec.decode(bm)
 	if err != nil {
 		msg := fmt.Sprintf("failed to decode raft message (%v)", err)
 		plog.Errorf(msg)
@@ -275,21 +288,23 @@ func (h *snapshotHandler) handleSnapshotCheck(w http.ResponseWriter, r *http.Req
 		recvFailures.WithLabelValues(r.RemoteAddr).Inc()
 		return
 	}
-	receivedBytes.WithLabelValues(m.FromGroup.String()).Add(float64(m.Size()))
+	for _, m := range bm.Msgs {
+		receivedBytes.WithLabelValues(m.FromGroup.String()).Add(float64(m.Size()))
 
-	if m.Type != raftpb.MsgSnap {
-		plog.Errorf("unexpected raft message type %s on snapshot path", m.Type)
-		http.Error(w, "wrong raft message type", http.StatusBadRequest)
-		return
+		if m.Type != raftpb.MsgSnap {
+			plog.Errorf("unexpected raft message type %s on snapshot path", m.Type)
+			http.Error(w, "wrong raft message type", http.StatusBadRequest)
+			return
+		}
+		running := h.checkSnapshotState(m)
+		if running {
+			plog.Infof("snapshot check for [index: %d, from: %s-%v] still waiting transfer", m.Snapshot.Metadata.Index, types.ID(m.From), m.ToGroup)
+			http.Error(w, "snapshot transfer still running", http.StatusAlreadyReported)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		plog.Infof("snapshot check for [index: %d, from: %s-%v] success", m.Snapshot.Metadata.Index, types.ID(m.From), m.ToGroup)
 	}
-	running := h.checkSnapshotState(m)
-	if running {
-		plog.Infof("snapshot check for [index: %d, from: %s-%v] still waiting transfer", m.Snapshot.Metadata.Index, types.ID(m.From), m.ToGroup)
-		http.Error(w, "snapshot transfer still running", http.StatusAlreadyReported)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-	plog.Infof("snapshot check for [index: %d, from: %s-%v] success", m.Snapshot.Metadata.Index, types.ID(m.From), m.ToGroup)
 }
 
 type streamHandler struct {
@@ -331,6 +346,8 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		t = streamTypeMsgAppV2
 	case streamTypeMessage.endpoint():
 		t = streamTypeMessage
+	case streamTypeMsgAppV3.endpoint():
+		t = streamTypeMsgAppV3
 	default:
 		plog.Debugf("ignored unexpected streaming request path %s", r.URL.Path)
 		http.Error(w, "invalid path", http.StatusNotFound)

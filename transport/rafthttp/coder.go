@@ -18,10 +18,11 @@ import "github.com/youzan/ZanRedisDB/raft/raftpb"
 
 type encoder interface {
 	// encode encodes the given message to an output stream.
+	encodeBatch(m *raftpb.BatchMessages) error
 	encode(m *raftpb.Message) error
 }
 
 type decoder interface {
 	// decode decodes the message from an input stream.
-	decode() (raftpb.Message, error)
+	decode(*raftpb.BatchMessages) (*raftpb.BatchMessages, error)
 }

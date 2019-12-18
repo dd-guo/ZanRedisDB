@@ -22,59 +22,66 @@ import (
 
 func TestPeerPick(t *testing.T) {
 	tests := []struct {
-		msgappWorking  bool
-		messageWorking bool
-		m              raftpb.Message
-		wpicked        string
+		msgappV3Working bool
+		msgappWorking   bool
+		messageWorking  bool
+		m               raftpb.Message
+		wpicked         string
 	}{
 		{
-			true, true,
+			true, true, true,
+			raftpb.Message{Type: raftpb.MsgApp, Term: 1, LogTerm: 1},
+			streamAppV3,
+		},
+		{
+			false, true, true,
 			raftpb.Message{Type: raftpb.MsgSnap},
 			pipelineMsg,
 		},
 		{
-			true, true,
+			false, true, true,
 			raftpb.Message{Type: raftpb.MsgApp, Term: 1, LogTerm: 1},
 			streamAppV2,
 		},
 		{
-			true, true,
+			false, true, true,
 			raftpb.Message{Type: raftpb.MsgProp},
 			streamMsg,
 		},
 		{
-			true, true,
+			false, true, true,
 			raftpb.Message{Type: raftpb.MsgHeartbeat},
 			streamMsg,
 		},
 		{
-			false, true,
+			false, false, true,
 			raftpb.Message{Type: raftpb.MsgApp, Term: 1, LogTerm: 1},
 			streamMsg,
 		},
 		{
-			false, false,
+			false, false, false,
 			raftpb.Message{Type: raftpb.MsgApp, Term: 1, LogTerm: 1},
 			pipelineMsg,
 		},
 		{
-			false, false,
+			false, false, false,
 			raftpb.Message{Type: raftpb.MsgProp},
 			pipelineMsg,
 		},
 		{
-			false, false,
+			false, false, false,
 			raftpb.Message{Type: raftpb.MsgSnap},
 			pipelineMsg,
 		},
 		{
-			false, false,
+			false, false, false,
 			raftpb.Message{Type: raftpb.MsgHeartbeat},
 			pipelineMsg,
 		},
 	}
 	for i, tt := range tests {
 		peer := &peer{
+			msgAppV3Writer: &streamWriter{working: tt.msgappV3Working},
 			msgAppV2Writer: &streamWriter{working: tt.msgappWorking},
 			writer:         &streamWriter{working: tt.messageWorking},
 			pipeline:       &pipeline{},

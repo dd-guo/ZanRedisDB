@@ -107,3 +107,7 @@ message ConfChange {
 	optional Group node_group  = 4 [(gogoproto.nullable) = false];
 	optional bytes           Context = 5;
 }
+
+message BatchMessages {
+	repeated Message msgs = 1 [(gogoproto.nullable) = false];
+}

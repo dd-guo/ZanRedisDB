@@ -38,8 +38,10 @@ import (
 const (
 	streamTypeMessage  streamType = "message"
 	streamTypeMsgAppV2 streamType = "msgappv2"
+	streamTypeMsgAppV3 streamType = "msgappv3"
 
-	streamBufSize = 4096
+	streamBufSize     = 4096
+	streamBufBodySize = msgAppV2BatchBufSize
 )
 
 var (
@@ -62,6 +64,8 @@ type streamType string
 
 func (t streamType) endpoint() string {
 	switch t {
+	case streamTypeMsgAppV3:
+		return path.Join(RaftStreamPrefix, "batchmsgapp")
 	case streamTypeMsgAppV2:
 		return path.Join(RaftStreamPrefix, "msgapp")
 	case streamTypeMessage:
@@ -74,6 +78,8 @@ func (t streamType) endpoint() string {
 
 func (t streamType) String() string {
 	switch t {
+	case streamTypeMsgAppV3:
+		return "stream Batched MsgApp v3"
 	case streamTypeMsgAppV2:
 		return "stream MsgApp v2"
 	case streamTypeMessage:
@@ -87,7 +93,8 @@ var (
 	// linkHeartbeatMessage is a special message used as heartbeat message in
 	// link layer. It never conflicts with messages from raft because raft
 	// doesn't send out messages without From and To fields.
-	linkHeartbeatMessage = raftpb.Message{Type: raftpb.MsgHeartbeat}
+	linkHeartbeatMessage       = raftpb.Message{Type: raftpb.MsgHeartbeat}
+	linkBatchHeartbeatMessages = raftpb.BatchMessages{Msgs: []raftpb.Message{raftpb.Message{Type: raftpb.MsgHeartbeat}}}
 )
 
 func isLinkHeartbeatMessage(m *raftpb.Message) bool {
@@ -149,6 +156,8 @@ func (cw *streamWriter) run() {
 	unflushed := 0
 
 	plog.Infof("started streaming with peer %s (writer)", cw.peerID)
+	var bm raftpb.BatchMessages
+	bm.Msgs = make([]raftpb.Message, 0, streamBufSize)
 
 	for {
 		select {
@@ -171,16 +180,11 @@ func (cw *streamWriter) run() {
 			heartbeatc, msgc = nil, nil
 
 		case m := <-msgc:
-			var err error
 			for done := false; !done; {
-				err = enc.encode(&m)
+				bm.Msgs = append(bm.Msgs, m)
 				unflushed += m.Size()
 				batched++
-				m.Entries = nil
-				if err != nil {
-					break
-				}
-				if batched > streamBufSize/2 {
+				if batched > streamBufSize/2 || unflushed > streamBufBodySize {
 					done = true
 					break
 				}
@@ -190,15 +194,21 @@ func (cw *streamWriter) run() {
 					done = true
 				}
 			}
+			err := enc.encodeBatch(&bm)
 			if err == nil {
 				flusher.Flush()
 				sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
 				unflushed = 0
 				batched = 0
 
+				for i, _ := range bm.Msgs {
+					bm.Msgs[i].Entries = nil
+				}
+				bm.Msgs = bm.Msgs[:0]
 				continue
 			}
 
+			bm.Msgs = bm.Msgs[:0]
 			cw.status.deactivate(failureType{source: t.String(), action: "write"}, err.Error())
 			cw.close()
 			plog.Warningf("lost the TCP streaming connection with peer %s (%s writer)", cw.peerID, t)
@@ -215,6 +225,9 @@ func (cw *streamWriter) run() {
 				enc = newMsgAppV2Encoder(conn.Writer, cw.ps)
 			case streamTypeMessage:
 				enc = &messageEncoder{w: conn.Writer}
+			case streamTypeMsgAppV3:
+				enc = newMsgAppV2BatchEncoder(conn.Writer, cw.ps)
+				plog.Infof("using batched stream msg app v3 for: %v", cw.peerID)
 			default:
 				plog.Panicf("unhandled stream type %s", conn.t)
 			}
@@ -377,6 +390,9 @@ func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
 		dec = newMsgAppV2Decoder(rc, cr.tr.ID, cr.peerID)
 	case streamTypeMessage:
 		dec = newMessageDecoder(rc)
+	case streamTypeMsgAppV3:
+		plog.Infof("using batched stream msg app v3 for: %v", cr.peerID)
+		dec = newMsgAppV2BatchDecoder(rc, cr.tr.ID, cr.peerID)
 	default:
 		plog.Panicf("unhandled stream type %s", t)
 	}
@@ -393,9 +409,13 @@ func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cr.processCancel = cancel
 	cr.mu.Unlock()
+	bm := &raftpb.BatchMessages{}
+	bm.Msgs = make([]raftpb.Message, 0, streamBufSize)
+	var err error
 
 	for {
-		m, err := dec.decode()
+		bm.Msgs = bm.Msgs[:0]
+		bm, err = dec.decode(bm)
 		if err != nil {
 			plog.Warningf("failed to decode message : %v", err)
 			cr.mu.Lock()
@@ -404,32 +424,34 @@ func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
 			return err
 		}
 
-		receivedBytes.WithLabelValues(m.FromGroup.Name).Add(float64(m.Size()))
+		for _, m := range bm.Msgs {
+			receivedBytes.WithLabelValues(m.FromGroup.Name).Add(float64(m.Size()))
 
-		cr.mu.Lock()
-		paused := cr.paused
-		cr.mu.Unlock()
+			cr.mu.Lock()
+			paused := cr.paused
+			cr.mu.Unlock()
 
-		if paused {
-			continue
-		}
+			if paused {
+				continue
+			}
 
-		if isLinkHeartbeatMessage(&m) {
-			// raft is not interested in link layer
-			// heartbeat message, so we should ignore
-			// it.
-			continue
-		}
-		if m.ToGroup.GroupId == 0 {
-			plog.Errorf("receive message not group: %v", m.String())
-		}
+			if isLinkHeartbeatMessage(&m) {
+				// raft is not interested in link layer
+				// heartbeat message, so we should ignore
+				// it.
+				continue
+			}
+			if m.ToGroup.GroupId == 0 {
+				plog.Errorf("receive message not group: %v", m.String())
+			}
 
-		err = cr.r.Process(ctx, m)
-		if cr.status.isActive() {
-			plog.MergeWarningf("dropped internal raft message from %s since receiving buffer is full (overloaded network)", types.ID(m.From))
+			err = cr.r.Process(ctx, m)
+			if cr.status.isActive() {
+				plog.MergeWarningf("dropped internal raft message from %s since receiving buffer is full (overloaded network)", types.ID(m.From))
+			}
+			plog.Debugf("dropped %s from %s since receiving buffer is full", m.Type, types.ID(m.From))
+			recvFailures.WithLabelValues(m.FromGroup.Name).Inc()
 		}
-		plog.Debugf("dropped %s from %s since receiving buffer is full", m.Type, types.ID(m.From))
-		recvFailures.WithLabelValues(m.FromGroup.Name).Inc()
 	}
 }
 

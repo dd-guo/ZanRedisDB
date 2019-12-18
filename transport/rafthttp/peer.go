@@ -48,6 +48,7 @@ const (
 	// all proposals in all raft group
 	maxPendingProposals = 4096 * 16
 
+	streamAppV3 = "streamMsgAppV3"
 	streamAppV2 = "streamMsgAppV2"
 	streamMsg   = "streamMsg"
 	pipelineMsg = "pipeline"
@@ -101,11 +102,13 @@ type peer struct {
 
 	picker *urlPicker
 
+	msgAppV3Writer *streamWriter
 	msgAppV2Writer *streamWriter
 	writer         *streamWriter
 	pipeline       *pipeline
 	snapSender     *snapshotSender // snapshot sender to send v3 snapshot messages
 	msgAppV2Reader *streamReader
+	msgAppV3Reader *streamReader
 	msgAppReader   *streamReader
 
 	mu     sync.Mutex
@@ -138,6 +141,7 @@ func startPeer(transport *Transport, urls types.URLs, peerID types.ID, ps *stats
 		r:              r,
 		status:         status,
 		picker:         picker,
+		msgAppV3Writer: startStreamWriter(peerID, status, ps, r),
 		msgAppV2Writer: startStreamWriter(peerID, status, ps, r),
 		writer:         startStreamWriter(peerID, status, ps, r),
 		pipeline:       pipeline,
@@ -146,6 +150,7 @@ func startPeer(transport *Transport, urls types.URLs, peerID types.ID, ps *stats
 	}
 
 	p.msgAppV2Reader = startStreamReader(peerID, streamTypeMsgAppV2, transport, picker, status, r)
+	p.msgAppV3Reader = startStreamReader(peerID, streamTypeMsgAppV3, transport, picker, status, r)
 	p.msgAppReader = startStreamReader(peerID, streamTypeMessage, transport, picker, status, r)
 
 	return p
@@ -186,6 +191,8 @@ func (p *peer) update(urls types.URLs) {
 func (p *peer) attachOutgoingConn(conn *outgoingConn) {
 	var ok bool
 	switch conn.t {
+	case streamTypeMsgAppV3:
+		ok = p.msgAppV3Writer.attach(conn)
 	case streamTypeMsgAppV2:
 		ok = p.msgAppV2Writer.attach(conn)
 	case streamTypeMessage:
@@ -208,6 +215,7 @@ func (p *peer) Pause() {
 	p.paused = true
 	p.msgAppReader.pause()
 	p.msgAppV2Reader.pause()
+	p.msgAppV3Reader.pause()
 }
 
 // Resume resumes a paused peer.
@@ -217,6 +225,7 @@ func (p *peer) Resume() {
 	p.paused = false
 	p.msgAppReader.resume()
 	p.msgAppV2Reader.resume()
+	p.msgAppV3Reader.resume()
 }
 
 func (p *peer) stop() {
@@ -225,10 +234,12 @@ func (p *peer) stop() {
 
 	close(p.stopc)
 	p.msgAppV2Writer.stop()
+	p.msgAppV3Writer.stop()
 	p.writer.stop()
 	p.pipeline.stop()
 	p.snapSender.stop()
 	p.msgAppV2Reader.stop()
+	p.msgAppV3Reader.stop()
 	p.msgAppReader.stop()
 }
 
@@ -240,6 +251,8 @@ func (p *peer) pick(m raftpb.Message) (writec chan<- raftpb.Message, picked stri
 	// stream for a long time, only use one of the N pipelines to send MsgSnap.
 	if isMsgSnap(m) {
 		return p.pipeline.msgc, pipelineMsg
+	} else if writec, ok = p.msgAppV3Writer.writec(); ok && isMsgApp(m) {
+		return writec, streamAppV3
 	} else if writec, ok = p.msgAppV2Writer.writec(); ok && isMsgApp(m) {
 		return writec, streamAppV2
 	} else if writec, ok = p.writer.writec(); ok {
