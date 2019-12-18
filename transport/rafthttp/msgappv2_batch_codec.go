@@ -43,7 +43,7 @@ func newMsgAppV2BatchEncoder(w io.Writer, ps *stats.PeerStats) *msgAppV2BatchEnc
 	return &msgAppV2BatchEncoder{
 		w:         w,
 		ps:        ps,
-		buf:       make([]byte, msgAppV2BufSize),
+		buf:       make([]byte, msgAppV2BatchBufSize),
 		uint64buf: make([]byte, 8),
 		uint8buf:  make([]byte, 1),
 	}
