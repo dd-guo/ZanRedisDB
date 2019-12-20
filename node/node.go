@@ -10,6 +10,7 @@ import (
 	math "math"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -105,19 +106,27 @@ const (
 )
 
 type waitReqHeaders struct {
-	wr   wait.WaitResult
-	done chan struct{}
-	reqs BatchInternalRaftRequest
-	pool *sync.Pool
+	ids       []uint64
+	wr        wait.WaitResult
+	completer chan RequestResultCode
+	pool      *sync.Pool
 }
 
 func (wrh *waitReqHeaders) release() {
 	if wrh != nil {
 		wrh.wr = nil
 		if wrh.pool != nil {
-			wrh.reqs.Reqs = wrh.reqs.Reqs[:0]
+			wrh.ids = wrh.ids[:0]
 			wrh.pool.Put(wrh)
 		}
+	}
+}
+
+func (wrh *waitReqHeaders) notify(r RequestResultCode) {
+	select {
+	case wrh.completer <- r:
+	default:
+		panic("notify request result should not block")
 	}
 }
 
@@ -131,8 +140,8 @@ func newWaitReqPoolArray() waitReqPoolArray {
 		_ = l
 		waitReqPool.New = func() interface{} {
 			obj := &waitReqHeaders{}
-			obj.reqs.Reqs = make([]InternalRaftRequest, 0, 1)
-			obj.done = make(chan struct{}, 1)
+			obj.ids = make([]uint64, 0, l)
+			obj.completer = make(chan RequestResultCode, 1)
 			obj.pool = waitReqPool
 			return obj
 		}
@@ -144,8 +153,8 @@ func newWaitReqPoolArray() waitReqPoolArray {
 func (wa waitReqPoolArray) getWaitReq(idLen int) *waitReqHeaders {
 	if idLen > maxPoolIDLen {
 		obj := &waitReqHeaders{}
-		obj.reqs.Reqs = make([]InternalRaftRequest, 0, idLen)
-		obj.done = make(chan struct{}, 1)
+		obj.ids = make([]uint64, 0, idLen)
+		obj.completer = make(chan RequestResultCode, 1)
 		return obj
 	}
 	index := 0
@@ -304,6 +313,18 @@ func (nd *KVNode) Start(standalone bool) error {
 		defer nd.wg.Done()
 		nd.applyCommits(nd.commitC)
 	}()
+
+	nd.wg.Add(1)
+	go func() {
+		defer nd.wg.Done()
+		nd.handleProposeReq()
+	}()
+	nd.wg.Add(1)
+	go func() {
+		defer nd.wg.Done()
+		nd.handleProposeRsp()
+	}()
+
 	nd.wg.Add(1)
 	go func() {
 		defer nd.wg.Done()
@@ -496,36 +517,168 @@ func (nd *KVNode) GetMergeHandler(cmd string) (common.MergeCommandFunc, bool, bo
 	return nd.router.GetMergeCmdHandler(cmd)
 }
 
-func (nd *KVNode) ProposeInternal(ctx context.Context, irr InternalRaftRequest, cancel context.CancelFunc) (*waitReqHeaders, error) {
-	wrh := nd.wrPools.getWaitReq(1)
-	wrh.reqs.Reqs = append(wrh.reqs.Reqs, irr)
-	wrh.reqs.ReqNum = 1
-	wrh.reqs.Timestamp = irr.Header.Timestamp
-	if len(wrh.done) != 0 {
-		wrh.done = make(chan struct{}, 1)
+func (nd *KVNode) handleProposeRsp() {
+	doWait := func(completer chan RequestResultCode, wr wait.WaitResult, ids []uint64) {
+		select {
+		case code := <-completer:
+			if code != ReqComplete {
+				for _, id := range ids {
+					nd.w.Trigger(id, ErrProposalCanceled)
+				}
+			}
+		case <-wr.WaitC():
+			// this batch has been processed
+		case <-nd.stopChan:
+			for _, id := range ids {
+				nd.w.Trigger(id, common.ErrStopped)
+			}
+		}
+
 	}
-	buffer, err := wrh.reqs.Marshal()
-	poolCost := time.Now().UnixNano() - irr.Header.Timestamp
-	// buffer will be reused by raft?
-	// TODO:buffer, err := reqList.MarshalTo()
-	if err != nil {
-		wrh.release()
-		return nil, err
+	for {
+		select {
+		case wh, ok := <-nd.waitReqCh:
+			if !ok {
+				nodeLog.Info("handle proposal response loop exit")
+				return
+			}
+			doWait(wh.completer, wh.wr, wh.ids)
+			wh.release()
+		}
+
 	}
-	wrh.wr = nd.w.RegisterWithC(irr.Header.ID, wrh.done)
-	err = nd.rn.node.ProposeWithDrop(ctx, buffer, cancel)
-	if err != nil {
-		nd.rn.Infof("propose failed : %v", err.Error())
-		nd.w.Trigger(irr.Header.ID, err)
-		wrh.release()
-		return nil, err
+}
+
+func (nd *KVNode) handleProposeReq() {
+	var reqList BatchInternalRaftRequest
+	reqList.Reqs = make([]InternalRaftRequest, 0, 100)
+	ireqs := make([]elemT, 0, 100)
+	var lastReq internalReq
+	// TODO: combine pipeline and batch to improve performance
+	// notice the maxPendingProposals config while using pipeline, avoid
+	// sending too much pipeline which overflow the proposal buffer.
+	//lastReqList := make([]*internalReq, 0, 1024)
+
+	wrPools := newWaitReqPoolArray()
+
+	defer func() {
+		if e := recover(); e != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			buf = buf[0:n]
+			nd.rn.Errorf("handle propose loop panic: %s:%v", buf, e)
+		}
+		for _, r := range reqList.Reqs {
+			nd.w.Trigger(r.Header.ID, common.ErrStopped)
+		}
+		nd.rn.Infof("handle propose loop exit")
+		reqs := nd.reqProposeC.get(false)
+		for _, r := range reqs {
+			nd.w.Trigger(r.reqData.Header.ID, common.ErrStopped)
+		}
+		close(nd.waitReqCh)
+	}()
+	for {
+		select {
+		case <-nd.readyC:
+			ireqs = nd.reqProposeC.get(false)
+			if len(ireqs) == 0 {
+				continue
+			}
+			// entryQueue.get will be reused, make sure copy entrys before next get
+			for _, r := range ireqs {
+				reqList.Reqs = append(reqList.Reqs, r.reqData)
+			}
+			lastReq = internalReq(ireqs[len(ireqs)-1])
+			ireqs = ireqs[:0]
+		case <-nd.stopChan:
+			return
+		}
+		reqList.ReqNum = int32(len(reqList.Reqs))
+		reqList.Timestamp = time.Now().UnixNano()
+		buffer, err := reqList.Marshal()
+		// buffer will be reused by raft?
+		// TODO:buffer, err := reqList.MarshalTo()
+		if err != nil {
+			nd.rn.Infof("failed to marshal request: %v", err)
+			for _, r := range reqList.Reqs {
+				nd.w.Trigger(r.Header.ID, err)
+			}
+			reqList.Reqs = reqList.Reqs[:0]
+			continue
+		}
+		start := lastReq.reqData.Header.Timestamp
+		cost := reqList.Timestamp - start
+		raftCost := int64(0)
+		if cost >= int64(proposeTimeout.Nanoseconds())/2 {
+			nd.rn.Infof("ignore slow for begin propose too late: %v, cost %v", len(reqList.Reqs), cost)
+			for _, r := range reqList.Reqs {
+				nd.w.Trigger(r.Header.ID, common.ErrQueueTimeout)
+			}
+		} else {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			var newCan context.CancelFunc
+			wh := wrPools.getWaitReq(len(reqList.Reqs))
+			if len(wh.completer) > 0 {
+				wh.completer = make(chan RequestResultCode, 1)
+			}
+			poolCost := time.Now().UnixNano() - reqList.Timestamp
+
+			cancel = func() {
+				wh.notify(ReqCancelled)
+			}
+			if lastReq.ctx == nil {
+				leftProposeTimeout := proposeTimeout + time.Second - time.Duration(cost)
+				ctx, newCan = context.WithTimeout(context.Background(), leftProposeTimeout)
+			} else {
+				ctx = lastReq.ctx
+			}
+			err = nd.rn.node.ProposeWithDrop(ctx, buffer, cancel)
+			if err != nil {
+				nd.rn.Infof("propose failed: %v, err: %v", len(reqList.Reqs), err.Error())
+				for _, r := range reqList.Reqs {
+					nd.w.Trigger(r.Header.ID, err)
+				}
+				wh.release()
+			} else {
+				proposalCost := time.Now().UnixNano() - reqList.Timestamp
+				if proposalCost >= int64(raftSlow.Nanoseconds()/2) {
+					nd.rn.Errorf("raft slow for batch propose: %v-%v, cost %v-%v, wait len: %v",
+						len(reqList.Reqs), cap(wh.ids), poolCost, proposalCost, len(nd.waitReqCh))
+				}
+				for _, r := range reqList.Reqs {
+					wh.ids = append(wh.ids, r.Header.ID)
+				}
+				wh.wr = lastReq.wr
+
+				//lastReqList = append(lastReqList, lastReq)
+				select {
+				case nd.waitReqCh <- wh:
+				case <-nd.stopChan:
+					if newCan != nil {
+						newCan()
+					}
+					wh.release()
+					return
+				}
+			}
+			tn := time.Now().UnixNano()
+			cost = tn - start
+			raftCost = tn - reqList.Timestamp
+			if newCan != nil {
+				newCan()
+			}
+		}
+		if raftCost >= int64(raftSlow.Nanoseconds()) {
+			nd.rn.Infof("raft slow for batch propose: %v, cost %v, wait len: %v", len(reqList.Reqs), raftCost, len(nd.waitReqCh))
+		}
+		if cost >= int64(time.Second.Nanoseconds())/2 {
+			nd.rn.Infof("slow for batch propose: %v, cost %v", len(reqList.Reqs), cost)
+		}
+		lastReq.reqData.Data = nil
+		reqList.Reqs = reqList.Reqs[:0]
 	}
-	proposalCost := time.Now().UnixNano() - irr.Header.Timestamp
-	if proposalCost >= int64(raftSlow.Nanoseconds()/2) {
-		nd.rn.Infof("raft slow for batch propose: %v, cost %v-%v, wait len: %v",
-			len(wrh.reqs.Reqs), poolCost, proposalCost, len(nd.waitReqCh))
-	}
-	return wrh, nil
 }
 
 func (nd *KVNode) SetDynamicInfo(dync NamespaceDynamicConf) {
@@ -641,12 +794,26 @@ func (nd *KVNode) queueRequest(req InternalRaftRequest) (interface{}, error) {
 	}
 	start := time.Now()
 	req.Header.Timestamp = start.UnixNano()
+	wr := nd.w.Register(req.Header.ID)
 	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
-	wrh, err := nd.ProposeInternal(ctx, req, cancel)
-	if err != nil {
-		return nil, err
+	ireq := internalReq{
+		reqData: req,
+		ctx:     ctx,
+		wr:      wr,
+	}
+	added, stopped := nd.reqProposeC.addWait(elemT(ireq), proposeTimeout/2)
+	if stopped {
+		nd.w.Trigger(req.Header.ID, common.ErrStopped)
+	} else if !added {
+		nd.w.Trigger(req.Header.ID, common.ErrQueueTimeout)
+	} else {
+		select {
+		case nd.readyC <- struct{}{}:
+		default:
+		}
 	}
 	//nd.rn.Infof("queue request: %v", req.reqData.String())
+	var err error
 	var rsp interface{}
 	var ok bool
 	// will always return a response, timed out or get a error
@@ -658,12 +825,11 @@ func (nd *KVNode) queueRequest(req InternalRaftRequest) (interface{}, error) {
 			err = ErrProposalCanceled
 		}
 		nd.w.Trigger(req.Header.ID, err)
-		<-wrh.wr.WaitC()
-	case <-wrh.wr.WaitC():
+		<-wr.WaitC()
+	case <-wr.WaitC():
 	}
-	rsp = wrh.wr.GetResult()
+	rsp = wr.GetResult()
 	cancel()
-	wrh.release()
 
 	if err, ok = rsp.(error); ok {
 		rsp = nil
