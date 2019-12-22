@@ -86,6 +86,7 @@ func (q *entryQueue) close() {
 	q.stopped = true
 	if q.waitC != nil {
 		close(q.waitC)
+		q.waitC = nil
 	}
 }
 

@@ -267,7 +267,11 @@ func TestKVNode_batchWithNonBatchCommand(t *testing.T) {
 				testKey := []byte(fmt.Sprintf("default:test:batchset_%v_%v", index, k))
 				setHandler(fc, buildCommand([][]byte{[]byte("set"), testKey, testKey}))
 				assert.Nil(t, fc.GetError())
-				assert.Equal(t, "OK", fc.rsp[0])
+				t.Logf("fc.rsp: %v", fc.rsp)
+				assert.True(t, len(fc.rsp) >= 1)
+				if len(fc.rsp) >= 1 {
+					assert.Equal(t, "OK", fc.rsp[0])
+				}
 			}
 		}(i)
 		go func(index int) {

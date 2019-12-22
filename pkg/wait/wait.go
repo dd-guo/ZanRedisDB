@@ -108,12 +108,7 @@ func (mw multList) Trigger(id uint64, x interface{}) {
 	w.l.Unlock()
 	if rd != nil {
 		rd.value = x
-		//close(rd.done)
-		select {
-		case rd.done <- struct{}{}:
-		default:
-			log.Panicf("done chan is full: %v", id)
-		}
+		close(rd.done)
 	}
 }
 
