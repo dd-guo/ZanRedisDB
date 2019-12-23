@@ -864,6 +864,8 @@ func (rc *raftNode) serveChannels() {
 		case <-rc.stopc:
 			return
 		case <-rc.node.EventNotifyCh():
+			// TODO: it may the apply loop is too slow but the raft messages continue come in, this may cause
+			// the raft memory storage grow without limit. We need pause the raft if too much fall behind in apply loop
 			moreEntriesToApply := cap(rc.commitC)-len(rc.commitC) > 3
 			rd, hasUpdate := rc.node.StepNode(moreEntriesToApply, rc.IsBusySnapshot())
 			if !hasUpdate {
