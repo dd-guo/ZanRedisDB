@@ -646,8 +646,8 @@ func (nd *KVNode) handleProposeReq() {
 			} else {
 				proposalCost := time.Since(tn)
 				if proposalCost >= raftSlow/2 {
-					nd.rn.Infof("raft slow for batch propose: %v-%v, cost %v-%v-%v, wait len: %v",
-						len(reqList.Reqs), cap(wh.ids), poolCost, marshalCost, proposalCost, len(nd.waitReqCh))
+					nd.rn.Infof("raft slow for batch propose: %v-%v, buf len: %v, cost %v-%v-%v, wait len: %v",
+						len(reqList.Reqs), cap(wh.ids), len(buffer), marshalCost, poolCost, proposalCost, len(nd.waitReqCh))
 				}
 				for _, r := range reqList.Reqs {
 					wh.ids = append(wh.ids, r.Header.ID)
